@@ -1,24 +1,21 @@
-#ifndef AIRFLOW.H
-#define AIRFLOW.H 
+#ifndef AIRFLOW_H
+#define AIRFLOW_H
 
-class Airflow{
-    private: 
-        const float pi = 3.14;
-        float inletDiameter;
-        float throatDiameter;
-        float airDensity;
-        float voltage;
-        float deltaPressure;
-        float airFlow;
-        void getData();
-        void convertVolttoPressure();
-        void bernoulli();
-    public: 
-        Airflow (float inletSize, float throatSize, float airdensity);
-        void printVoltage();
-        void printdeltaPressure();
-        float getAirflow();
-        void airflowSetup(int sda,int scl, int address);
+class Airflow {
+  private:
+    float inletDiameter;
+    float throatDiameter;
+    float airDensity;
+    float voltage;
+    float deltaPressure;
+    float airFlow;
+    float offsetVoltage = 0.0;
+
+  public:
+    Airflow(float inletSize, float throatSize, float airdensity);
+    void airflowSetup(int sda, int scl, int address);
+    void calibrateAirflow();
+    float getAirflow();
 };
 
 #endif
