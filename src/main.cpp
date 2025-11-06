@@ -6,14 +6,16 @@
 #include "DFRobot_OxygenSensor.h"
 #include "SparkFun_SCD30_Arduino_Library.h"
 #include "Wire.h"
+#include <math.h>
+#include "ads_reader.h"
+#include "calculate.h"
 
 #define SDA_PIN 19
 #define SCL_PIN 20
 #define O2_ADDR 0x73
 #define AIRFLOW_ADDR 0x48
-#define INLET_SIZE 25.0
-#define THROAT_SIZE 10.0
-#define AIR_DENSITY 1.225
+#define INLET_SIZE 0.037
+#define THROAT_SIZE 0.015   
 #define AIRFLOW_BUFFER_SIZE 200
 #define AIRVOLUME_BUFFER_SIZE 200
 #define CALC_CALORIE_PERIOD_MS 60000
@@ -29,23 +31,95 @@ TimerHandle_t xCalorieTimer = NULL;
 
 using namespace std;
 
+// ===================== Geometry (SI) =====================
+static constexpr float INLET_DIAMETER_M = 0.0370f;  // 3.7 cm
+static constexpr float THROAT_DIAMETER_M = 0.0150f; // 1.5 cm
+static constexpr float AIR_DENSITY = 1.225f;        // kg/m^3
+
+// ===================== I2C / ADS =====================
+
+ADSReader ads(0x48, GAIN_TWO, SDA_PIN, SCL_PIN); // A0-A1 diff
+
+// ===================== Button (ZERO + RESET) =====================
+static constexpr int CAL_BUTTON_PIN = 18; // active-LOW
+static constexpr uint32_t DEBOUNCE_MS = 50;
+
+// ===================== MPX10DP Scale =====================
+// Can be set at runtime with "K <Pa>"
+static float SCALE_PA_PER_VOLT = 4000.0f; // Pa/V (placeholder)
+
+// ===================== Filters & thresholds =====================
+static constexpr float LPF_ALPHA = 0.2f;
+static constexpr int MA_WINDOW = 5;
+static constexpr float INACTIVITY_S = 1.0f;
+
+// Fix zero-creep:
+static constexpr float DP_DEADBAND_PA = 0.1f;    // set ΔP=0 if |ΔP|<5 Pa
+static constexpr float FLOW_IGNORE_ML_S = 20.0f; // ignore <100 mL/s for integration/breath
+
+// ===================== Calc object =====================
+Calculate calc(INLET_DIAMETER_M, THROAT_DIAMETER_M, AIR_DENSITY);
+
+// ===================== State =====================
+float zeroVolt = 0.0f;
+float totalVolume_L = 0.0f;
+float last_Q_L_s = 0.0f;
+uint32_t lastMs = 0;
+
+float maBuf[MA_WINDOW];
+int maIdx = 0;
+bool maFull = false;
+
+struct Sample
+{
+    float flow_mL_s;
+    uint32_t ms;
+};
+static const size_t FLOW_BUF_MAX = 1024;
+Sample breathBuf[FLOW_BUF_MAX];
+size_t breathN = 0;
+uint32_t lastActiveTick = 0;
+
+float peak_mL_s_5s = 0.0f, sum_mL_s_5s = 0.0f;
+int cnt_5s = 0;
+
 
 double calculateVolume(const RingBuffer<double> &buffer, double samplingRate, size_t samplingSize);
 void calibrateSensors(float knownO2Percent = 20.9, float knownCO2ppm = 400.0);
-
+float applyMA(float x);
+void clearSession();
+void doZero();
+void applySpanFromPa(float known_Pa);
+void printHelp();
+void printParams();
+void integrateBreathIfIdle(uint32_t nowTick);
+void handleSerial();
 
 void readPressure(void *pvParameters) {
   float airFlow;
   for (;;) {
-    airFlow = airflow.getAirflow();
-    airflowBuffer.push(airFlow);
+    float vdiff = ads.readDiffVoltFiltered() - zeroVolt;
+
+   
+    float dP_Pa = vdiff * SCALE_PA_PER_VOLT;
+    if (fabsf(dP_Pa) < DP_DEADBAND_PA)
+        dP_Pa = 0.0f;
+    if (dP_Pa < 0)
+        dP_Pa = 0;
+
+    
+    float Q_mL_s = calc.airflow_mLs(dP_Pa, 0.0f);
+    if (Q_mL_s < FLOW_IGNORE_ML_S)
+        Q_mL_s = 0.0f; // ignore tiny flows for integration
+    float Q_mL_s_view = applyMA(Q_mL_s);
+    airflowBuffer.push(Q_mL_s_view);
     vTaskDelay(pdMS_TO_TICKS(10)); 
   }
 }
 
 void getAirvolume(void *pvParameters) {
   for (;;) {
-    double airVolume = calculateVolume(airflowBuffer, 0.05, 20); 
+    double airVolume = calculateVolume(airflowBuffer, 0.01, 50); 
     airvolumeBuffer.push(airVolume);
     vTaskDelay(pdMS_TO_TICKS(100)); 
   }
@@ -138,7 +212,7 @@ void commandTask(void *pvParameters) {
       }
 
       else {
-        Serial.println("❓ Unknown command.");
+        Serial.println(" Unknown command.");
       }
     }
 
@@ -238,4 +312,163 @@ void calibrateSensors(float knownO2Percent, float knownCO2ppm) {
   Serial.println(" ppm");
 
   Serial.println("\n--- Calibration Complete ---");
+}
+
+// ===================== Utils =====================
+float applyMA(float x)
+{
+    maBuf[maIdx] = x;
+    maIdx = (maIdx + 1) % MA_WINDOW;
+    if (maIdx == 0)
+        maFull = true;
+    float s = 0;
+    int n = maFull ? MA_WINDOW : maIdx;
+    if (n <= 0)
+        return x;
+    for (int i = 0; i < n; ++i)
+        s += maBuf[i];
+    return s / n;
+}
+
+void clearSession()
+{
+    totalVolume_L = 0.0f;
+    last_Q_L_s = 0.0f;
+    breathN = 0;
+    peak_mL_s_5s = 0.0f;
+    sum_mL_s_5s = 0.0f;
+    cnt_5s = 0;
+    Serial.println(F("[RESET] total volume & buffers cleared"));
+}
+
+// Zero offset (avg) + RESET totals
+void doZero()
+{
+    Serial.println(F("[ZERO] Mulai... pastikan dua port setara tekanan"));
+    float sum = 0.0f;
+    const int N = 1000; // increased for steadier zero
+    for (int i = 0; i < N; ++i)
+    {
+        sum += ads.readDiffVoltFiltered();
+        delay(5);
+    }
+    zeroVolt = sum / N;
+    Serial.print(F("[ZERO] zeroVolt="));
+    Serial.print(zeroVolt, 6);
+    Serial.println(F(" V"));
+    clearSession();
+}
+
+// Span: set SCALE Pa/V using current Vdiff at known Pa
+void applySpanFromPa(float known_Pa)
+{
+    float vdiff = ads.readDiffVoltFiltered() - zeroVolt;
+    if (fabsf(vdiff) < 1e-6f)
+    {
+        Serial.println(F("[SPAN] Vdiff ~0 V. Naikkan ΔP lalu ulangi."));
+        return;
+    }
+    SCALE_PA_PER_VOLT = known_Pa / vdiff;
+    Serial.print(F("[SPAN] Set SCALE_PA_PER_VOLT = "));
+    Serial.print(SCALE_PA_PER_VOLT, 2);
+    Serial.println(F(" Pa/V"));
+}
+
+void printHelp()
+{
+    Serial.println();
+    Serial.println(F("Commands:"));
+    Serial.println(F("  ?        : help"));
+    Serial.println(F("  Z        : ZERO + reset total volume"));
+    Serial.println(F("  K <Pa>   : span set SCALE = Pa / Vdiff_now"));
+    Serial.println(F("  R        : reset total volume only"));
+    Serial.println(F("  P        : print parameters & constants"));
+    Serial.println();
+}
+
+void printParams()
+{
+    Serial.println(F("==== PARAMETER ===="));
+    Serial.print(F("Inlet Dia  (m): "));
+    Serial.println(INLET_DIAMETER_M, 6);
+    Serial.print(F("Throat Dia (m): "));
+    Serial.println(THROAT_DIAMETER_M, 6);
+    Serial.print(F("Air density  : "));
+    Serial.println(AIR_DENSITY, 3);
+    Serial.print(F("Scale Pa/V   : "));
+    Serial.println(SCALE_PA_PER_VOLT, 2);
+    Serial.print(F("K (mL/s)/sqrt(Pa): "));
+    Serial.println(calc.k_mLs(), 3);
+    Serial.println(F("==================="));
+}
+
+void integrateBreathIfIdle(uint32_t nowTick)
+{
+    float idle_s = (nowTick - lastActiveTick) * portTICK_PERIOD_MS / 1000.0f;
+    if (breathN >= 2 && idle_s >= INACTIVITY_S)
+    {
+        double mL = 0.0;
+        for (size_t i = 1; i < breathN; ++i)
+        {
+            double dt = (breathBuf[i].ms - breathBuf[i - 1].ms) / 1000.0;
+            mL += 0.5 * (breathBuf[i - 1].flow_mL_s + breathBuf[i].flow_mL_s) * dt;
+        }
+        float L = mL / 1000.0f;
+        totalVolume_L += L;
+
+        float peakThis = 0.0f;
+        for (size_t i = 0; i < breathN; ++i)
+            if (breathBuf[i].flow_mL_s > peakThis)
+                peakThis = breathBuf[i].flow_mL_s;
+
+        Serial.print(F("[BREATH] Vol="));
+        Serial.print(L, 3);
+        Serial.print(F(" L, Peak="));
+        Serial.print(peakThis, 0);
+        Serial.println(F(" mL/s"));
+        breathN = 0;
+    }
+}
+
+void handleSerial()
+{
+    static String line;
+    while (Serial.available())
+    {
+        char c = (char)Serial.read();
+        Serial.print("Received: ");
+        Serial.println(c);
+        if (c == '\n' || c == '\r')
+        {
+            if (line.length())
+            {
+                line.trim();
+                if (line.equalsIgnoreCase("?"))
+                    printHelp();
+                else if (line.equalsIgnoreCase("Z"))
+                    doZero();
+                else if (line.equalsIgnoreCase("R"))
+                {
+                    clearSession();
+                }
+                else if (line.equalsIgnoreCase("P"))
+                    printParams();
+                else if (line.startsWith("K "))
+                {
+                    float pa = line.substring(2).toFloat();
+                    if (pa > 0)
+                        applySpanFromPa(pa);
+                    else
+                        Serial.println(F("[ERR] Format: K <Pa>, contoh: K 500"));
+                }
+                else
+                {
+                    Serial.println(F("[?] Tidak dikenal. Ketik '?' untuk help."));
+                }
+                line = "";
+            }
+        }
+        else
+            line += c;
+    }
 }
