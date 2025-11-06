@@ -12,7 +12,7 @@
 
 #define SDA_PIN 19
 #define SCL_PIN 20
-#define O2_ADDR 0x73
+const uint8_t O2_ADDR = 0x73;
 #define AIRFLOW_ADDR 0x48
 #define INLET_SIZE 0.037
 #define THROAT_SIZE 0.015   
@@ -27,9 +27,63 @@ SCD30 co2sensor;
 Airflow airflow(INLET_SIZE, THROAT_SIZE, AIR_DENSITY);
 RingBuffer<double> airflowBuffer(AIRFLOW_BUFFER_SIZE);
 RingBuffer<double> airvolumeBuffer(AIRVOLUME_BUFFER_SIZE);
+RingBuffer<double> o2Buffer(AIRVOLUME_BUFFER_SIZE);
 TimerHandle_t xCalorieTimer = NULL;
 
 using namespace std;
+
+// fase turun (eksalasi / O2 turun) -> hasil 2 titik
+const float slope_down_base = 0.964f;
+const float offset_down_base = 1.225f;
+
+// fase naik (recovery / balik ke ambient) -> hasil global
+const float slope_up_base = 1.0546f;
+const float offset_up_base = -1.0998f;
+
+// ====== Parameter pembacaan ======
+const uint16_t AVG_N = 20;              // averaging internal library
+const uint32_t SAMPLE_MS = 200;         // interval baca ~5 Hz
+const float DEAD_BAND = 0.002f;         // deadband arah (%Vol)
+const uint32_t FRC_DURATION = 120000UL; // 2 menit fase FRC (ms)
+
+// ====== State & objek ======
+DFRobot_OxygenSensor oxygen;
+
+enum TrendMode : uint8_t
+{
+    MODE_UNKNOWN = 0,
+    MODE_DOWN,
+    MODE_UP
+};
+enum Phase : uint8_t
+{
+    PHASE_FRC = 0,
+    PHASE_DYNAMIC
+};
+
+TrendMode currentMode = MODE_UNKNOWN;
+Phase currentPhase = PHASE_FRC;
+
+float lastRaw = NAN;
+
+// baseline (hasil rata-rata fase FRC)
+float baseRaw = NAN;  // rata-rata raw
+float baseTrue = NAN; // rata-rata corrected (FRC)
+
+// offset efektif (setelah di-anchoring ke baseline)
+float slope_down = slope_down_base;
+float offset_down = offset_down_base;
+float slope_up = slope_up_base;
+float offset_up = offset_up_base;
+
+// akumulasi untuk rata-rata FRC
+double sumRawFRC = 0.0;
+double sumTrueFRC = 0.0;
+uint32_t countFRC = 0;
+
+uint32_t startMillis = 0;
+
+// ====== Helper ======
 
 // ===================== Geometry (SI) =====================
 static constexpr float INLET_DIAMETER_M = 0.0370f;  // 3.7 cm
@@ -94,6 +148,28 @@ void printHelp();
 void printParams();
 void integrateBreathIfIdle(uint32_t nowTick);
 void handleSerial();
+static inline float applyCalDown(float raw)
+{
+    return slope_down * raw + offset_down;
+}
+
+static inline float applyCalUp(float raw)
+{
+    return slope_up * raw + offset_up;
+}
+
+// pilih mode naik/turun berdasarkan perubahan raw + deadband
+static inline TrendMode decideMode(float rawNow, float rawPrev, TrendMode prevMode)
+{
+    if (isnan(rawPrev))
+        return MODE_DOWN; // default awal
+    if (rawNow < rawPrev - DEAD_BAND)
+        return MODE_DOWN;
+    if (rawNow > rawPrev + DEAD_BAND)
+        return MODE_UP;
+    return prevMode; // dalam deadband -> jangan gonta-ganti mode
+}
+
 
 void readPressure(void *pvParameters) {
   float airFlow;
@@ -125,11 +201,85 @@ void getAirvolume(void *pvParameters) {
   }
 }
 
+float get02(){
+      // 1) Baca raw dari sensor
+    float rawNow = oxygen.getOxygenData(AVG_N);
+
+    uint32_t now = millis();
+
+    if (currentPhase == PHASE_FRC)
+    {
+        // ========= PHASE FRC (2 MENIT PERTAMA) =========
+        // pakai garis DOWN base sebagai koreksi
+        float corrDown = slope_down_base * rawNow + offset_down_base;
+
+        // akumulasi untuk rata-rata baseline
+        sumRawFRC += rawNow;
+        sumTrueFRC += corrDown;
+        countFRC++;
+
+        // print pakai label FRC (biar keliatan di serial)
+        Serial.printf("%.3f\tFRC\t%.3f\n", rawNow, corrDown);
+
+        // kalau sudah lewat 2 menit dan punya cukup data -> kunci baseline
+        if (now - startMillis >= FRC_DURATION && countFRC > 10)
+        {
+            baseRaw = (float)(sumRawFRC / (double)countFRC);
+            baseTrue = (float)(sumTrueFRC / (double)countFRC);
+
+            // re-anchoring: paksa kedua garis (DOWN & UP) lewat titik (baseRaw, baseTrue)
+            slope_down = slope_down_base;
+            slope_up = slope_up_base;
+            offset_down = baseTrue - slope_down * baseRaw;
+            offset_up = baseTrue - slope_up * baseRaw;
+
+            Serial.println("\n== FRC PHASE DONE ==");
+            Serial.printf("Samples FRC : %lu\n", (unsigned long)countFRC);
+            Serial.printf("baseRaw     : %.6f %%Vol (rata-rata raw)\n", baseRaw);
+            Serial.printf("baseTrue    : %.6f %%Vol (rata-rata corrected/FRC)\n", baseTrue);
+            Serial.println("Garis kalibrasi di-ANCHOR ke baseline ini:");
+            Serial.printf("  DOWN: corrected = %.6f * raw + %.6f\n", slope_down, offset_down);
+            Serial.printf("  UP  : corrected = %.6f * raw + %.6f\n", slope_up, offset_up);
+            Serial.println("Keduanya melewati (baseRaw, baseTrue). Masuk PHASE_DYNAMIC.\n");
+
+            currentPhase = PHASE_DYNAMIC;
+            currentMode = MODE_DOWN; // mulai dari DOWN saja
+            lastRaw = rawNow;        // inisialisasi untuk deteksi arah
+        } return lastRaw;
+    }
+    else
+    {
+        // ========= PHASE DYNAMIC (setelah FRC) =========
+
+        // 1) tentukan mode naik/turun
+        currentMode = decideMode(rawNow, lastRaw, currentMode);
+
+        // 2) apply kalibrasi sesuai mode, tapi SUDAH di-anchor ke baseline
+        float corrected;
+        const char *modeStr;
+        if (currentMode == MODE_UP)
+        {
+            corrected = applyCalUp(rawNow);
+            modeStr = "UP";
+        }
+        else
+        { // MODE_DOWN & MODE_UNKNOWN -> pakai DOWN
+            corrected = applyCalDown(rawNow);
+            modeStr = (currentMode == MODE_DOWN) ? "DOWN" : "INIT(DOWN)";
+        }
+
+        Serial.printf("%.3f\t%s\t%.3f\n", rawNow, modeStr, corrected);
+
+        lastRaw = rawNow;
+        return corrected;
+    } 
+
+}
 
 void calculateCalorie(TimerHandle_t xTimer) {
   double kCal;
   float co2 = co2sensor.getCO2();
-  float o2 = oxygen.getOxygenData(20);  
+  float o2 = get02();  
   double airVolume = airvolumeBuffer.getSum(0, 60);  
   double vo2 = (ATMOSPHERE_O2 - o2) * airVolume;
   double vco2 = co2 * airVolume;
@@ -224,7 +374,8 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   Serial.begin(115200);
   delay(2000);
-
+    startMillis = millis();
+    currentPhase = PHASE_FRC;
   airflow.airflowSetup(SDA_PIN, SCL_PIN, AIRFLOW_ADDR);
   airflow.calibrateAirflow();
   Serial.println("Airflow Calibration Finished");
