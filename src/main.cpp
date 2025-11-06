@@ -228,7 +228,16 @@ void setup() {
   airflow.airflowSetup(SDA_PIN, SCL_PIN, AIRFLOW_ADDR);
   airflow.calibrateAirflow();
   Serial.println("Airflow Calibration Finished");
-  
+  ads.setClock(100000);
+    ads.setLPFAlpha(LPF_ALPHA);
+  if (!ads.beginAuto())
+    {
+        Serial.println(F("[ERR] ADS1115 not found. Cek wiring & ADDR (0x48..0x4B)."));
+        ads.i2cScan();
+        while (1)
+            delay(300);
+    }
+
   if (!oxygen.begin(O2_ADDR)) {
     Serial.println("Oxygen sensor init failed");
     while (1) delay(1000);
