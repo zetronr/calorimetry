@@ -20,11 +20,11 @@ const uint8_t O2_ADDR = 0x73;
 #define AIRVOLUME_BUFFER_SIZE 200
 #define CALC_CALORIE_PERIOD_MS 60000
 #define ATMOSPHERE_O2 20.9
-
+double Airdensity = 1.2225f;
 
 DFRobot_OxygenSensor oxygen;
 SCD30 co2sensor;
-Airflow airflow(INLET_SIZE, THROAT_SIZE, AIR_DENSITY);
+Airflow airflow(INLET_SIZE, THROAT_SIZE, Airdensity);
 RingBuffer<double> airflowBuffer(AIRFLOW_BUFFER_SIZE);
 RingBuffer<double> airvolumeBuffer(AIRVOLUME_BUFFER_SIZE);
 RingBuffer<double> o2Buffer(AIRVOLUME_BUFFER_SIZE);
@@ -46,8 +46,6 @@ const uint32_t SAMPLE_MS = 200;         // interval baca ~5 Hz
 const float DEAD_BAND = 0.002f;         // deadband arah (%Vol)
 const uint32_t FRC_DURATION = 120000UL; // 2 menit fase FRC (ms)
 
-// ====== State & objek ======
-DFRobot_OxygenSensor oxygen;
 
 enum TrendMode : uint8_t
 {
@@ -92,7 +90,7 @@ static constexpr float AIR_DENSITY = 1.225f;        // kg/m^3
 
 // ===================== I2C / ADS =====================
 
-ADSReader ads(0x48, GAIN_TWO, SDA_PIN, SCL_PIN); // A0-A1 diff
+ADSReader ads1(0x48, GAIN_TWO, SDA_PIN, SCL_PIN); // A0-A1 diff
 
 // ===================== Button (ZERO + RESET) =====================
 static constexpr int CAL_BUTTON_PIN = 18; // active-LOW
@@ -174,7 +172,7 @@ static inline TrendMode decideMode(float rawNow, float rawPrev, TrendMode prevMo
 void readPressure(void *pvParameters) {
   float airFlow;
   for (;;) {
-    float vdiff = ads.readDiffVoltFiltered() - zeroVolt;
+    float vdiff = ads1.readDiffVoltFiltered() - zeroVolt;
 
    
     float dP_Pa = vdiff * SCALE_PA_PER_VOLT;
@@ -186,7 +184,7 @@ void readPressure(void *pvParameters) {
     
     float Q_mL_s = calc.airflow_mLs(dP_Pa, 0.0f);
     if (Q_mL_s < FLOW_IGNORE_ML_S)
-        Q_mL_s = 0.0f; // ignore tiny flows for integration
+        Q_mL_s = 0.0f; 
     float Q_mL_s_view = applyMA(Q_mL_s);
     airflowBuffer.push(Q_mL_s_view);
     vTaskDelay(pdMS_TO_TICKS(10)); 
@@ -379,12 +377,12 @@ void setup() {
   airflow.airflowSetup(SDA_PIN, SCL_PIN, AIRFLOW_ADDR);
   airflow.calibrateAirflow();
   Serial.println("Airflow Calibration Finished");
-  ads.setClock(100000);
-    ads.setLPFAlpha(LPF_ALPHA);
-  if (!ads.beginAuto())
+  ads1.setClock(100000);
+    ads1.setLPFAlpha(LPF_ALPHA);
+  if (!ads1.beginAuto())
     {
         Serial.println(F("[ERR] ADS1115 not found. Cek wiring & ADDR (0x48..0x4B)."));
-        ads.i2cScan();
+        ads1.i2cScan();
         while (1)
             delay(300);
     }
@@ -509,7 +507,7 @@ void doZero()
     const int N = 1000; // increased for steadier zero
     for (int i = 0; i < N; ++i)
     {
-        sum += ads.readDiffVoltFiltered();
+        sum += ads1.readDiffVoltFiltered();
         delay(5);
     }
     zeroVolt = sum / N;
@@ -522,7 +520,7 @@ void doZero()
 // Span: set SCALE Pa/V using current Vdiff at known Pa
 void applySpanFromPa(float known_Pa)
 {
-    float vdiff = ads.readDiffVoltFiltered() - zeroVolt;
+    float vdiff = ads1.readDiffVoltFiltered() - zeroVolt;
     if (fabsf(vdiff) < 1e-6f)
     {
         Serial.println(F("[SPAN] Vdiff ~0 V. Naikkan ΔP lalu ulangi."));
